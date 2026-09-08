@@ -230,6 +230,16 @@ AXApplication  "Chrome"
 matches by title *and* role, and presses the button with `AXPress` - again with
 no mouse movement and no focus stealing.
 
+An approval is logged only once the sheet is verified gone, and "gone" is judged
+by the AX references that were pressed, never by what now sits at those
+coordinates - Chrome draws the next queued prompt exactly where the last one was,
+so a geometry check would call a dismissed sheet still up and miss a real
+approval. Under load `AXPress` can report success while the sheet outlives the
+check. A longer AX timeout and a re-press clears that, and there is no synthetic
+click anywhere in the engine: a cursorless one was tried four ways and Chrome
+ignores them all, and a pointer-moving one would break the promise above. A sheet
+that outlives the retries is logged FAILED and pressed again next sweep.
+
 Two macOS-specific traps, both found by running `docs/mac/ax_probe.py` against a
 live prompt:
 

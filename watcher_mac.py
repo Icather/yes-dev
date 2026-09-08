@@ -12,8 +12,12 @@ and the counter, the clouds and the burst guard in the tray all work unchanged.
 identity of the AX refs that were pressed (a dismissed sheet's refs answer every
 read with AXError -25202), never by whether something still sits at its
 coordinates: Chrome queues these prompts when several CDP clients connect at
-once and draws the next one exactly where the last one was. A sheet that
-survives AXPress falls through to a CGEvent click at the Allow button's center.
+once and draws the next one exactly where the last one was. Under multi-client
+load AXPress can report success while the sheet outlives the verify wait; a longer
+AX messaging timeout and a re-press clears that with no click at all. There is no
+synthetic click at all: a sheet that survives the retries is logged FAILED and
+pressed again next sweep, so a real approval is never missed, and a Chrome that
+ignored AXPress would show up in the log rather than get a blind click.
 
 The dialog's shape in the accessibility tree, confirmed against a live prompt on
 Chrome 152, is an AXSheet on the browser window wrapping an alert:
@@ -63,6 +67,7 @@ try:
         AXUIElementCreateApplication,
         AXUIElementCopyAttributeValue,
         AXUIElementPerformAction,
+        AXUIElementSetMessagingTimeout,
         AXValueGetValue,
         kAXErrorInvalidUIElement,
         kAXErrorSuccess,
@@ -75,22 +80,6 @@ except ImportError:
         "Yes, Dev macOS engine needs pyobjc:\n"
         "    pip3 install pyobjc-framework-Cocoa pyobjc-framework-ApplicationServices"
     )
-
-try:
-    from Quartz import (
-        CGEventCreate,
-        CGEventCreateMouseEvent,
-        CGEventGetLocation,
-        CGEventPost,
-        kCGEventLeftMouseDown,
-        kCGEventLeftMouseUp,
-        kCGEventMouseMoved,
-        kCGHIDEventTap,
-        kCGMouseButtonLeft,
-    )
-    _HAVE_QUARTZ = True
-except ImportError:
-    _HAVE_QUARTZ = False
 
 # Chrome variants. Edge is Chromium too and shows the same dialog; the tray adds
 # it to the bundle set when "Include Microsoft Edge" is on.
@@ -110,15 +99,10 @@ DEDUPE_SECONDS = 2.0     # don't re-press one dialog mid-teardown ...
 DEDUPE_MAX = 400         # ... but cap the memory so a long run can't grow forever
 # ponytail: fixed sleep, not AX notification. Bump if Chrome teardown gets slower.
 VERIFY_WAIT_S = 0.5
+AX_RETRIES = 2                 # extra AXPress attempts before any synthetic click
+AX_MESSAGING_TIMEOUT_S = 2.0   # give a busy Chrome longer to answer the re-press
 
 
-def _button_center(pos: tuple[float, float], size: tuple[float, float]) -> tuple[float, float]:
-    """Return the midpoint of an AX button frame in global top-left points."""
-    return (pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0)
-
-
-# ponytail: click-point only; live AX/CGEvent needs a real Chrome sheet.
-assert _button_center((3968.0, 657.0), (76.0, 36.0)) == (4006.0, 675.0)
 
 
 def _attr(element, name):
@@ -391,54 +375,50 @@ class Engine:
             return True
         return _is_visible(host)
 
-    def _hw_click(self, x: float, y: float) -> bool:
-        """Left-click global point (x, y), then put the cursor back. Returns False if Quartz is missing."""
-        if not _HAVE_QUARTZ:
-            return False
-        try:
-            cursor = CGEventCreate(None)
-            origin = CGEventGetLocation(cursor) if cursor else None
-            point = (x, y)
-            move = CGEventCreateMouseEvent(None, kCGEventMouseMoved, point, kCGMouseButtonLeft)
-            down = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, point, kCGMouseButtonLeft)
-            up = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, point, kCGMouseButtonLeft)
-            CGEventPost(kCGHIDEventTap, move)
-            time.sleep(0.03)
-            CGEventPost(kCGHIDEventTap, down)
-            time.sleep(0.03)
-            CGEventPost(kCGHIDEventTap, up)
-            if origin is not None:
-                back = CGEventCreateMouseEvent(None, kCGEventMouseMoved, origin, kCGMouseButtonLeft)
-                CGEventPost(kCGHIDEventTap, back)
-            return True
-        except Exception:
-            return False
+    def _ax_retry(self, host, button) -> bool:
+        """Re-issue AXPress a couple of times before reporting the sheet still up.
 
-    def _approve(self, host, button) -> str | None:
-        """Dismiss the consent sheet. Returns how it fell only after the sheet is gone."""
+        Live runs showed AXPress reporting success and the sheet still standing
+        after VERIFY_WAIT_S under multi-client load - slow teardown, not a button
+        that ignores AX. A longer messaging timeout plus a re-press clears that
+        with no cursor, no focus change and no coordinates at all: it targets the
+        same ref the identity check watches, so it cannot land on a queued
+        successor. True once the sheet is verified gone."""
+        for element in (button, host):
+            try:
+                AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_S)
+            except Exception:
+                pass
+        for _ in range(AX_RETRIES):
+            if _ref_alive(button) is False:
+                return True
+            self._press(button)
+            time.sleep(VERIFY_WAIT_S)
+            if not self._sheet_still_up(host, button):
+                return True
+        return False
+
+    def _approve(self, pid: int, host, button) -> str | None:
+        """Dismiss the consent sheet. Returns how it fell, only once the sheet is
+        verified gone, and never by moving the pointer or activating Chrome."""
         self._raise_host(host)
         ax_ok = self._press(button) is not None
         time.sleep(VERIFY_WAIT_S)
         if not self._sheet_still_up(host, button):
             return "AXPress" if ax_ok else "AXRaise"
 
-        # Geometry from the live button ref, read now, so the click targets
-        # this button wherever it is - never a queued successor's coordinates.
-        pos = _ax_point(button)
-        size = _ax_size(button)
-        if pos is None or size is None:
-            # It stopped answering between the check and the read: if the ref
-            # has gone invalid, AXPress did land and teardown just finished.
-            if not self._sheet_still_up(host, button):
-                return "AXPress" if ax_ok else "AXRaise"
-            return None
-        x, y = _button_center(pos, size)
-        self.log(f"  AXPress left sheet up; CGEvent click at ({x:.1f}, {y:.1f})", "AUDIT")
-        if not self._hw_click(x, y):
-            return None
-        time.sleep(VERIFY_WAIT_S)
-        if not self._sheet_still_up(host, button):
-            return "CGEvent"
+        # The load case: AXPress accepted, teardown slower than the wait. A
+        # longer AX timeout and a re-press clears it without any click.
+        if self._ax_retry(host, button):
+            return "AXPress-retry"
+
+        # Nothing synthetic beyond this point. A cursorless click was tried four
+        # ways - CGEventPostToPid bound to the sheet's window, to the browser
+        # window, with a preceding move, and unbound - and Chrome ignored every
+        # one, while a HID click moves the pointer, which this engine promises
+        # not to do. So a sheet that outlives the retries is reported and pressed
+        # again next sweep: the dedupe slot is dropped on FAILED, which makes
+        # this an unbounded AX retry at poll rate with a visible trail in the log.
         return None
 
     def _element_summary(self, element) -> str:
@@ -518,7 +498,7 @@ class Engine:
 
                     self.log(f"approval pending host={key} siblings={labels!r} "
                              f"target={self._element_summary(button)}", "AUDIT")
-                    how = self._approve(host, button)
+                    how = self._approve(pid, host, button)
                     # The dedupe slot has done its job either way. On success
                     # the pressed sheet is verified gone, and a queued prompt
                     # Chrome draws at the same coordinates carries the same
@@ -531,7 +511,7 @@ class Engine:
                         self.log(f"  APPROVED via {how}", "ACTION")
                         self.log(f"  total approved this session: {self.approved}")
                     else:
-                        self.log("  FAILED: sheet still up after AXPress/CGEvent", "ERROR")
+                        self.log("  FAILED: sheet still up after AXPress and retries - pressing again next sweep", "ERROR")
                 except Exception as exc:
                     self.log(f"  host error: {exc!r}", "ERROR")
 

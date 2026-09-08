@@ -3,6 +3,64 @@
 Newest first. Each entry says what changed and, where it matters, what was
 measured - the numbers are from this repo's own runs, not estimates.
 
+## 1.2.0
+
+The macOS engine, hardened against real load. Most of this began as a pull
+request from [crimsonsunset](https://github.com/crimsonsunset) (#1). The rest
+came out of testing it against queued prompts on a live Chrome 152.
+
+### macOS: a scan that costs nothing when idle
+
+The engine walked every Chrome window's accessibility tree twelve levels deep,
+four times a second, whether or not a prompt existed. On a loaded page that walk
+descends into the page's own AX-exposed DOM. Measured here at ~85 ms per sweep,
+a third of a core spent finding nothing. The PR author saw 150-160 ms and CPU in
+double digits over hours. The dialog only ever lives one level below a browser
+window, as a sheet or a direct child, so that is all the scan reads now.
+
+| idle scan, per Chrome process | |
+|---|---|
+| 1.1.0 | ~85 ms |
+| 1.2.0 | 0.4 ms |
+
+### macOS: an approval is counted only once the sheet is really gone
+
+`[ACTION]` used to be written the moment `AXPress` returned success. It is now
+written only after the sheet is verified gone, and "gone" is judged by the
+identity of the AX references that were pressed, never by what sits at their
+coordinates. That distinction matters. Chrome queues the consent prompt when
+several clients connect at once and draws the next one at exactly the position
+and size of the one just dismissed, so a geometry check reports "still up" for a
+sheet that has gone, and a real approval gets logged FAILED. The burst guard
+counts `[ACTION]` lines, so it went blind in precisely the burst it exists for.
+
+Measured, three clients queued. Before: one client let in, zero `[ACTION]`, one
+FAILED. After: three in, three `[ACTION]`, zero FAILED.
+
+### macOS: no synthetic clicks, and the pointer never moves
+
+Under that load `AXPress` can report success while the sheet outlives the verify
+wait. That is slow teardown, not a button that ignores AX. A longer AX messaging
+timeout and a re-press clears it. In the same three-client run one approval
+landed first time and two on the retry, with no click of any kind.
+
+The PR had covered that case with a hardware mouse click, which works but moves
+the pointer, the one thing this engine promises never to do. A cursorless
+alternative, `CGEventPostToPid` bound to the sheet's own window, was tried four
+ways and Chrome ignored every one. So there is no synthetic click in the engine
+at all now. A sheet that outlives the retries is logged FAILED and pressed again
+next sweep, an unbounded AX retry at poll rate with a visible trail in the log,
+the same observable failure mode as Windows rather than a blind click.
+`pyobjc-framework-Quartz` is no longer required.
+
+### Also
+
+- Run from a bare script, the macOS tray no longer puts an icon in the Dock or
+  an entry in Cmd-Tab. It declares itself an accessory, as a proper bundle would.
+- `watcher_mac.py --diagnostics` logs trust, process discovery and per-sweep
+  scan timing every five seconds. Cheap, and it is what produced the numbers
+  above.
+
 ## 1.1.0
 
 Two headline changes: **macOS support**, and a **critical memory fix for
