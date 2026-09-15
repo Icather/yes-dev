@@ -58,6 +58,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The tray starts us with `-BrowserProcess chrome,msedge`, and powershell.exe -File
+# hands arguments over as raw OS argv: a comma-separated string binds to [string[]]
+# as ONE element ("chrome,msedge"), not two. Get-Process -Name then looks for a
+# process literally called "chrome,msedge", finds none, and the PID guard below
+# skips every dialog - silently, because of -ErrorAction SilentlyContinue. Split on
+# commas here so a single string and a real array behave the same.
+$BrowserProcess = @(
+    $BrowserProcess | ForEach-Object { $_ -split ',' } |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ }
+)
+
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
@@ -200,6 +212,7 @@ $approved   = 0
 $lastSeen   = @{}                    # hwnd -> last action, so one dialog is not clicked twice
 $procIds    = @()
 $pidsAt     = [datetime]::MinValue
+$procIdsWarned = $false              # report an unusable -BrowserProcess once, not never
 $lastTidy   = [datetime]::Now
 $self       = [System.Diagnostics.Process]::GetCurrentProcess()
 $parent     = $null
@@ -226,6 +239,17 @@ while ($true) {
                 $procIds = @(Get-Process -Name $BrowserProcess -ErrorAction SilentlyContinue |
                              Select-Object -ExpandProperty Id)
                 $pidsAt = Get-Date
+                # A dialog is on screen yet not one browser process matched: the name
+                # list is wrong and every window below falls through the PID guard.
+                # Say so once, instead of doing nothing in silence for days.
+                if ($procIds.Count -eq 0) {
+                    if (-not $procIdsWarned) {
+                        Write-Log "browser list matched no process: $($BrowserProcess -join '+')" 'WARN'
+                        $procIdsWarned = $true
+                    }
+                } else {
+                    $procIdsWarned = $false
+                }
             }
 
             foreach ($h in $hwnds) {
