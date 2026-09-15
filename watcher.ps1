@@ -41,9 +41,17 @@ param(
     [int]$IntervalMs = 250,
     [string]$LogPath = "$env:LOCALAPPDATA\YesDev\yes-dev.log",
     # Title of the consent dialog window.
-    [string]$DialogPattern = '(?i)^allow remote debugging\?$',
+    # The dialog title is LOCALISED. A zh-CN UI shows U+662F U+5426 U+5141 U+8BB8
+    # U+8FDC U+7A0B U+8C03 U+8BD5 followed by '?', so the original English-only
+    # pattern matched nothing there: the engine started, logged nothing further,
+    # and every attach timed out - a silent no-op.
+    # The CJK is written as \uXXXX escapes on purpose. Windows PowerShell 5.1
+    # decodes .ps1 files as ANSI (GBK on a zh-CN system), so a literal CJK string
+    # here would become mojibake and the regex would still never match.
+    [string]$DialogPattern = '(?i)^(allow remote debugging\?|\u662F\u5426\u5141\u8BB8\u8FDC\u7A0B\u8C03\u8BD5\?)$',
     # Button to press. Anchored so "Turn off in settings" is never hit.
-    [string]$ApprovePattern = '(?i)^(allow|approve)$',
+    # zh-CN label is U+5141 U+8BB8 ; ASCII-only for the same reason as above.
+    [string]$ApprovePattern = '(?i)^(allow|approve|\u5141\u8BB8)$',
     [string[]]$BrowserProcess = @('chrome'),
     # Class of the window that hosts the dialog.
     [string]$WindowClass = 'Chrome_WidgetWin_1',
